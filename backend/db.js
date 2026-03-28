@@ -1,92 +1,125 @@
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const path = require('path');
+require('dotenv').config();
 
-const dbPath = process.env.DB_PATH || './htu_swap.db';
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error('Error opening database:', err.message);
-  } else {
-    console.log('Connected to SQLite database.');
-    db.run("PRAGMA foreign_keys = ON;");
-    initializeTables();
-  }
+// Default connection string if running locally or not provided
+const dbString = process.env.DATABASE_URL;
+
+const pool = new Pool({
+  connectionString: dbString,
+  // If connecting to a remote DB like Neon, SSL is required
+  ssl: dbString && !dbString.includes('localhost') ? { rejectUnauthorized: false } : false
 });
 
-function initializeTables() {
-  db.serialize(() => {
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle pg client', err);
+});
+
+async function initializeTables() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
     // Students table
-    db.run(`CREATE TABLE IF NOT EXISTS students (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      phone TEXT UNIQUE NOT NULL,
-      name TEXT NOT NULL,
-      password_hash TEXT NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    await client.query(`CREATE TABLE IF NOT EXISTS students (
+      id SERIAL PRIMARY KEY,
+      phone VARCHAR(255) UNIQUE NOT NULL,
+      name VARCHAR(255) NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);
 
     // Courses table
-    db.run(`CREATE TABLE IF NOT EXISTS courses (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      course_number TEXT NOT NULL,
-      course_name TEXT NOT NULL,
+    await client.query(`CREATE TABLE IF NOT EXISTS courses (
+      id SERIAL PRIMARY KEY,
+      course_number VARCHAR(255) NOT NULL,
+      course_name VARCHAR(255) NOT NULL,
       hours INTEGER
     )`);
 
     // Sections table
-    db.run(`CREATE TABLE IF NOT EXISTS sections (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      course_id INTEGER NOT NULL,
-      section_number TEXT NOT NULL,
-      instructor TEXT,
-      schedule TEXT,
-      FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
+    await client.query(`CREATE TABLE IF NOT EXISTS sections (
+      id SERIAL PRIMARY KEY,
+      course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+      section_number VARCHAR(255) NOT NULL,
+      instructor VARCHAR(255),
+      schedule VARCHAR(255)
     )`);
 
     // Requests table (one per student per course)
-    db.run(`CREATE TABLE IF NOT EXISTS requests (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      student_id INTEGER NOT NULL,
-      course_id INTEGER NOT NULL,
-      current_section_id INTEGER NOT NULL,
-      wanted_section_ids TEXT NOT NULL, -- JSON array of section IDs
-      status TEXT DEFAULT 'active',     -- active | matched | closed
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(student_id, course_id),
-      FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
-      FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE,
-      FOREIGN KEY (current_section_id) REFERENCES sections(id) ON DELETE CASCADE
+    await client.query(`CREATE TABLE IF NOT EXISTS requests (
+      id SERIAL PRIMARY KEY,
+      student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+      course_id INTEGER NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+      current_section_id INTEGER NOT NULL REFERENCES sections(id) ON DELETE CASCADE,
+      wanted_section_ids TEXT NOT NULL, 
+      status VARCHAR(50) DEFAULT 'active',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(student_id, course_id)
     )`);
 
     // Matches table
-    db.run(`CREATE TABLE IF NOT EXISTS matches (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      request_a_id INTEGER NOT NULL,
-      request_b_id INTEGER NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (request_a_id) REFERENCES requests(id) ON DELETE CASCADE,
-      FOREIGN KEY (request_b_id) REFERENCES requests(id) ON DELETE CASCADE
+    await client.query(`CREATE TABLE IF NOT EXISTS matches (
+      id SERIAL PRIMARY KEY,
+      request_a_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+      request_b_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    console.log('Database tables initialized.');
-  });
+    await client.query('COMMIT');
+    console.log('PostgreSQL database tables initialized.');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error initializing tables:', err);
+  } finally {
+    client.release();
+  }
 }
 
-// Promisified helpers
-db.getAsync = (sql, params = []) =>
-  new Promise((resolve, reject) =>
-    db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)))
-  );
+const initPromise = dbString ? initializeTables().catch(console.error) : Promise.resolve();
+if (!dbString) {
+  console.log('No DATABASE_URL provided. Skipping table initialization.');
+}
 
-db.allAsync = (sql, params = []) =>
-  new Promise((resolve, reject) =>
-    db.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)))
-  );
+// Convert SQLite `?` to Postgres `$1, $2, ...`
+function convertQuery(sql) {
+  let count = 1;
+  return sql.replace(/\?/g, () => `$${count++}`);
+}
 
-db.runAsync = (sql, params = []) =>
-  new Promise((resolve, reject) =>
-    db.run(sql, params, function (err) {
-      if (err) reject(err);
-      else resolve({ lastID: this.lastID, changes: this.changes });
-    })
-  );
+// Promisified helpers replacing sqlite3 interface with pg
+const db = {
+  getAsync: async (sql, params = []) => {
+    if (!dbString) return null;
+    const res = await pool.query(convertQuery(sql), params);
+    return res.rows[0]; // Returns undefined if no rows, similar to sqlite db.get
+  },
+
+  allAsync: async (sql, params = []) => {
+    if (!dbString) return [];
+    const res = await pool.query(convertQuery(sql), params);
+    return res.rows;
+  },
+
+  runAsync: async (sql, params = []) => {
+    if (!dbString) return { lastID: null, changes: 0 };
+    const convertedSql = convertQuery(sql);
+    let finalSql = convertedSql;
+    
+    // Automatically append RETURNING id for inserts to populate result.lastID
+    if (convertedSql.trim().toUpperCase().startsWith('INSERT') && !convertedSql.toUpperCase().includes('RETURNING')) {
+      finalSql = convertedSql + ' RETURNING id';
+    }
+    
+    const res = await pool.query(finalSql, params);
+    return {
+      lastID: (res.rows && res.rows.length > 0) ? res.rows[0].id : null,
+      changes: res.rowCount
+    };
+  },
+  
+  pool: pool,
+  initPromise: initPromise
+};
 
 module.exports = db;

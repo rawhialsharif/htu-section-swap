@@ -38,7 +38,7 @@ async function importCsv(csvFilePath) {
   }
 
   // Wait for DB to be ready
-  await new Promise((r) => setTimeout(r, 500));
+  await db.initPromise;
 
   console.log(`Importing courses from: ${absolutePath}`);
 
@@ -100,7 +100,7 @@ async function importCsv(csvFilePath) {
   }
 
   console.log(`Import complete: ${coursesAdded} courses, ${sectionsAdded} sections added.`);
-  db.close();
+  await db.pool.end();
 }
 
 const csvPath = process.argv[2];
